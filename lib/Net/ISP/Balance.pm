@@ -3,9 +3,10 @@ package Net::ISP::Balance;
 use strict;
 use Net::Netmask;
 use IO::String;
+use Fcntl ':flock';
 use Carp 'croak','carp';
 
-our $VERSION    = '1.00';
+our $VERSION    = '1.02';
 
 =head1 NAME
 
@@ -52,6 +53,14 @@ Net::ISP::Balance - Support load balancing across multiple internet service prov
 =cut
 
 use Carp;
+
+=head1 USAGE
+
+This library supports load_balance.pl, a script to load-balance a home
+network across two or more Internet Service Providers (ISP). The
+load_balance.pl script can be found in the bin subdirectory of this
+distribution. Installation and configuraiton instructions can be found
+in the README.md file.
 
 =head1 FREQUENTLY-USED METHODS
 
@@ -210,6 +219,10 @@ object to emit firewall and routing rules.
 
 sub set_routes_and_firewall {
     my $self = shift;
+    unless ($self->isp_services) {
+	warn "No ISP services seem to be up. Not altering routing tables or firewall.\n";
+	return;
+    }
     $self->enable_forwarding(0);
     $self->set_routes();
     $self->set_firewall();
@@ -336,15 +349,17 @@ sub forward {
 
     my @dev = map {$self->dev($_)} $self->isp_services;
 
-    for my $protocol (@protocols) {
-	$self->iptables("-t nat -A PREROUTING -p $protocol --dport $port -j DNAT --to-destination $host");
-	for my $lan ($self->lan_services) {
-	    my $landev = $self->dev($lan);
-	    my $lannet = $self->net($lan);
-	    my $lanip  = $self->ip($lan);
-	    my $syn    = $protocol eq 'tcp' ? '--syn' : '';
-	    $self->iptables("-A FORWARD -p $protocol -o $landev $syn -d $dhost --dport $dport -j ACCEPT");
-	    $self->iptables("-t nat -A POSTROUTING -p $protocol -d $dhost -o $landev --dport $dport -j SNAT --to $lanip");
+    for my $dev (@dev) {
+	for my $protocol (@protocols) {
+	    $self->iptables("-t nat -A PREROUTING -i $dev -p $protocol --dport $port -j DNAT --to-destination $host");
+	    for my $lan ($self->lan_services) {
+		my $landev = $self->dev($lan);
+		my $lannet = $self->net($lan);
+		my $lanip  = $self->ip($lan);
+		my $syn    = $protocol eq 'tcp' ? '--syn' : '';
+		$self->iptables("-A FORWARD -p $protocol -o $landev $syn -d $dhost --dport $dport -j ACCEPT");
+#		$self->iptables("-t nat -A POSTROUTING -p $protocol -d $dhost -o $landev --dport $dport -j SNAT --to $lanip");
+	    }
 	}
     }
 }
@@ -420,6 +435,51 @@ sub lan_services {
     my $self = shift;
     my @n    = $self->service_names;
     return grep {$self->role($_) eq 'lan'} @n;
+}
+
+=head2 $state = $bal->event($service => $new_state)
+
+Record a transition between "up" and "down" for a named service. The
+first argument is the name of the ISP service that has changed,
+e.g. "CABLE". The second argument is either "up" or "down".
+
+The method returns a hashref in which the keys are the ISP service names
+and the values are one of 'up' or 'down'.
+
+The persistent state information is stored in /var/lib/lsm/ under a
+series of files named <SERVICE_NAME>.state.
+
+=cut
+
+sub event {
+    my $self = shift;
+
+    if (@_) {
+	my ($svc,$new_state) = @_;
+	$new_state =~ /^(up|down)$/  or croak "state must be 'up' or  down'";
+	$self->dev($svc)             or croak "service '$svc' is unknown";
+	my $file = "/var/lib/lsm/${svc}.state";
+	my $mode = -e $file ? '+<' : '>';
+	open my $fh,$mode,$file or croak "Couldn't open $file: $!";
+	flock $fh,LOCK_EX;
+	truncate $fh,0;
+	seek($fh,0,0);
+	print $fh $new_state;
+	close $fh;
+    }
+
+    my %state;
+    for my $svc ($self->isp_services) {
+	my $file = "/var/lib/lsm/${svc}.state";
+	open my $fh,'<',$file or croak "Couldn't open $file: $!";
+	flock $fh,LOCK_SH;
+	my $state = <$fh>;
+	close $fh;
+	$state{$svc}=$state;
+    }
+    my @up = grep {$state{$_} eq 'up'} keys %state;
+    $self->up(@up);
+    return \%state;
 }
 
 =head2 @up = $bal->up(@up_services)
@@ -629,7 +689,7 @@ Ubuntu/Debian-derived systems, this will be the directory
 
 sub default_lsm_scripts_dir {
     my $self = shift;
-    return $self->install_etc.'/lsm/';
+    return $self->install_etc.'/lsm';
 }
 
 =head2 $file = $bal->bal_conf_file([$new_file])
@@ -719,11 +779,12 @@ Possible switches and their defaults are:
 sub lsm_config_text {
     my $self = shift;
     my %args = @_;
-    my $scripts_dir = $self->lsm_scripts_dir;
+    my $scripts_dir    = $self->lsm_scripts_dir;
+    my $balance_script = $self->install_etc."/load_balance.pl";
     my %defaults = (
                       -checkip              => '127.0.0.1',
                       -debug                => 8,
-                      -eventscript          => "$scripts_dir/balancer_event_script",
+                      -eventscript          => $balance_script,
                       -notifyscript         => "$scripts_dir/default_script",
                       -max_packet_loss      => 15,
                       -max_successive_pkts_lost =>  7,
@@ -1235,7 +1296,7 @@ iptables -A DROPGEN -j LOG -m limit --limit 1/minute --log-level 4 --log-prefix 
 iptables -A DROPGEN -j DROP
 
 iptables -N DROPINVAL
-iptables -A DROPINVAL -j LOG -m limit --limit 1/minute --log-level 5 --log-prefix "INVALID: "
+iptables -A DROPINVAL -j LOG -m limit --limit 1/minute --log-level 4 --log-prefix "INVALID: "
 iptables -A DROPINVAL -j DROP
 
 iptables -N DROPPERM
@@ -1243,11 +1304,11 @@ iptables -A DROPPERM -j LOG -m limit --limit 1/minute --log-level 4 --log-prefix
 iptables -A DROPPERM -j DROP
 
 iptables -N DROPSPOOF
-iptables -A DROPSPOOF -j LOG -m limit --limit 1/minute --log-level 3 --log-prefix "DROP-SPOOF: "
+iptables -A DROPSPOOF -j LOG -m limit --limit 1/minute --log-level 4 --log-prefix "DROP-SPOOF: "
 iptables -A DROPSPOOF -j DROP
 
 iptables -N DROPFLOOD
-iptables -A DROPFLOOD -m limit --limit 1/minute  -j LOG --log-level 3 --log-prefix "DROP-FLOOD: "
+iptables -A DROPFLOOD -m limit --limit 1/minute  -j LOG --log-level 4 --log-prefix "DROP-FLOOD: "
 iptables -A DROPFLOOD -j DROP
 
 iptables -N DEBUG
@@ -1423,6 +1484,38 @@ sub nat_fw_rules {
     $self->iptables('-t nat -A POSTROUTING -o',$self->dev($_),'-j MASQUERADE')
 	foreach $self->isp_services;
 }
+
+=head2 $bal->start_lsm()
+
+Start an lsm process.
+
+=cut
+
+sub start_lsm {
+    my $self = shift;
+    my $lsm_conf = $self->lsm_conf_file;
+    system "/usr/bin/lsm $lsm_conf /var/run/lsm.pid";
+}
+
+=head2 $bal->signal_lsm($signal)
+
+Send a signal to a running LSM and return true if successfully
+signalled. The signal can be numeric (e.g. 9) or a string ('TERM').
+
+=cut
+
+sub signal_lsm {
+    my $self = shift;
+    my $signal = shift;
+    $signal   ||= 0;
+    my $pid;
+    open my $f,'/var/run/lsm.pid' or return;
+    chomp($pid = <$f>);
+    close $f;
+    return unless $pid =~ /^\d+$/;
+    return kill($signal=>$pid);
+}
+
 
 1;
 

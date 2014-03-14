@@ -15,10 +15,10 @@ name: Net-ISP-Balance
 provides:
   Net::ISP::Balance:
     file: lib/Net/ISP/Balance.pm
-    version: 1.00
+    version: 1.02
 requires:
   IO::String: 0
   Net::Netmask: 0
 resources:
   license: http://dev.perl.org/licenses/
-version: 1.00
+version: 1.02
