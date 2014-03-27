@@ -1,12 +1,14 @@
 package Net::ISP::Balance;
 
 use strict;
-use Net::Netmask;
 use IO::String;
 use Fcntl ':flock';
 use Carp 'croak','carp';
 
-our $VERSION    = '1.02';
+eval 'use Net::Netmask';
+eval 'use Net::ISP::Balance::ConfigData';
+
+our $VERSION    = '1.03';
 
 =head1 NAME
 
@@ -59,8 +61,8 @@ use Carp;
 This library supports load_balance.pl, a script to load-balance a home
 network across two or more Internet Service Providers (ISP). The
 load_balance.pl script can be found in the bin subdirectory of this
-distribution. Installation and configuraiton instructions can be found
-in the README.md file.
+distribution. Installation and configuration instructions can be found
+at http://lstein.github.io/Net-ISP-Balance/.
 
 =head1 FREQUENTLY-USED METHODS
 
@@ -131,9 +133,8 @@ load balancing script.Contained in this directory are subdirectories named "rout
 define additional routing rules. The latter contains files or perl
 scripts that define additional firewall rules.
 
-Any files you put into these directories will be read in alphabetic
-order and added to the routes and/or firewall rules emitted by the
-load balancing script.
+Note that files ending in ~ or starting with # are treated as autosave files 
+and ignored.
 
 A typical routing rules file will look like the example shown
 below.
@@ -288,7 +289,7 @@ sub sh {
     }
 }
 
-=head2 $bal->iptables(@args), but not executed.
+=head2 $bal->iptables(@args)
 
 Invoke sh() to call "iptables @args". 
 
@@ -460,7 +461,7 @@ sub event {
 	$self->dev($svc)             or croak "service '$svc' is unknown";
 	my $file = "/var/lib/lsm/${svc}.state";
 	my $mode = -e $file ? '+<' : '>';
-	open my $fh,$mode,$file or croak "Couldn't open $file: $!";
+	open my $fh,$mode,$file or croak "Couldn't open $file mode $mode: $!";
 	flock $fh,LOCK_EX;
 	truncate $fh,0;
 	seek($fh,0,0);
@@ -471,11 +472,14 @@ sub event {
     my %state;
     for my $svc ($self->isp_services) {
 	my $file = "/var/lib/lsm/${svc}.state";
-	open my $fh,'<',$file or croak "Couldn't open $file: $!";
-	flock $fh,LOCK_SH;
-	my $state = <$fh>;
-	close $fh;
-	$state{$svc}=$state;
+	if (open my $fh,'<',$file) {
+	    flock $fh,LOCK_SH;
+	    my $state = <$fh>;
+	    close $fh;
+	    $state{$svc}=$state;
+	} else {
+	    $state{$svc}='unknown';
+	}
     }
     my @up = grep {$state{$_} eq 'up'} keys %state;
     $self->up(@up);
@@ -675,7 +679,7 @@ On Ubuntu/Debian-derived systems, this will be the file
 
 sub default_lsm_conf_file {
     my $self = shift;
-    return $self->install_etc."/lsm.conf";
+    return $self->install_etc."/balance/lsm.conf";
 }
 
 =head2 $dir = Net::ISP::Balance->default_lsm_scripts_dir
@@ -844,6 +848,8 @@ sub _parse_configuration_file {
 	}
 	my ($service,$device,$role,$ping_dest) = split /\s+/;
 	next unless $service && $device && $role;
+	croak "load_balance.conf line $.: A service can not be named 'up' or 'down'"
+	    if $service=~/^(up|down)$/;
 	$services{$service}{dev}=$device;
 	$services{$service}{role}=$role;
 	$services{$service}{ping}=$ping_dest;
@@ -1254,7 +1260,10 @@ sub _execute_rules_files {
     my @files = @_;
 
     for my $f (@files) {
+	next if $f =~ /~$/;   # ignore emacs backup files
+	next if $f =~ /^#/;   # ignore autosave files
 	print STDERR "# executing contents of $f\n" if $self->verbose;
+	$self->sh("## Including rules from $f ##\n");
 	next if $f =~ /(~|\.bak)$/ or $f=~/^#/;
 
 	if ($f =~ /\.pl$/) {  # perl script
@@ -1266,6 +1275,7 @@ sub _execute_rules_files {
 	    $self->sh($_) while <$fh>;
 	    close $fh;
 	}
+	$self->sh("## Finished $f ##\n");
     }
 }
 
@@ -1442,13 +1452,14 @@ sub sanity_fw_rules {
 	# any outgoing udp packet is fine with me
 	$self->iptables("-A OUTPUT  -p udp -s $net -j ACCEPT");
 
-	# allow domain and time services
-	$self->iptables(['-A INPUT   -p udp --source-port domain -j ACCEPT',
-			 "-A FORWARD -p udp --source-port domain -d $net -j ACCEPT"]);
-
-	# time
-	$self->iptables(['-A INPUT   -p udp --source-port ntp -j ACCEPT',
-			 "-A FORWARD -p udp --source-port ntp -d $net -j ACCEPT"]);
+# These lines are now contained in 02.forwardings.pl
+#	# allow domain and time services
+#	$self->iptables(['-A INPUT   -p udp --source-port domain -j ACCEPT',
+#			 "-A FORWARD -p udp --source-port domain -d $net -j ACCEPT"]);
+#
+#	# time
+#	$self->iptables(['-A INPUT   -p udp --source-port ntp -j ACCEPT',
+#			 "-A FORWARD -p udp --source-port ntp -d $net -j ACCEPT"]);
 
 	# lan/wan forwarding
 	# allow lan/wan forwarding
@@ -1481,6 +1492,7 @@ This is called by set_firewall() to set up basic NAT rules for lan traffic over 
 
 sub nat_fw_rules {
     my $self = shift;
+    return unless $self->lan_services;
     $self->iptables('-t nat -A POSTROUTING -o',$self->dev($_),'-j MASQUERADE')
 	foreach $self->isp_services;
 }
@@ -1493,8 +1505,9 @@ Start an lsm process.
 
 sub start_lsm {
     my $self = shift;
+    my $lsm      = Net::ISP::Balance::ConfigData->config('lsm_path');
     my $lsm_conf = $self->lsm_conf_file;
-    system "/usr/bin/lsm $lsm_conf /var/run/lsm.pid";
+    system "$lsm $lsm_conf /var/run/lsm.pid";
 }
 
 =head2 $bal->signal_lsm($signal)
