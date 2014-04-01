@@ -8,7 +8,7 @@ use Carp 'croak','carp';
 eval 'use Net::Netmask';
 eval 'use Net::ISP::Balance::ConfigData';
 
-our $VERSION    = '1.03';
+our $VERSION    = '1.04';
 
 =head1 NAME
 
@@ -117,14 +117,16 @@ output as a series of shell script commands if echo_only() is set to
 true.
 
 The routing tables and firewall rules are based on the configuration
-described in balance.conf (usually /etc/network/balance.conf or
-/etc/sysconfig/network-scripts/balance.conf). You may add custom
-routes and rules by creating files in /etc/network/balance/routes and
-/etc/network/balance/firewall
-(/etc/sysconfig/network-scripts/balance/{routes,firewalls} on
-RedHat/CentOS systems). The former contains a series of files or perl
-scripts that define additional routing rules. The latter contains
-files or perl scripts that define additional firewall rules.
+described in $ETC_NETWORK/balance.conf. You may add custom routes and
+rules by creating files in $ETC_NETWORK/balance/routes and
+$ETC_NETWORK/balance/firewall. The former contains a series of files
+or perl scripts that define additional routing rules. The latter
+contains files or perl scripts that define additional firewall rules.
+
+Files located in $ETC_NETWORK/balance/pre-run will be executed just
+before load_balance.pl emits any route/firewall commands, while those
+in $ETC_NETWORK/balance/post-run will be run after load_balance.pl is
+finished.
 
 Any files you put into these directories will be read in alphabetic
 order and added to the routes and/or firewall rules emitted by the
@@ -224,10 +226,12 @@ sub set_routes_and_firewall {
 	warn "No ISP services seem to be up. Not altering routing tables or firewall.\n";
 	return;
     }
+    $self->pre_run_rules();
     $self->enable_forwarding(0);
     $self->set_routes();
     $self->set_firewall();
     $self->enable_forwarding(1);
+    $self->post_run_rules();
 }
 
 =head2 $verbose = $bal->verbose([boolean]);
@@ -322,6 +326,253 @@ sub iptables {
     }
 }
 
+sub _iptables_add_rule {
+    my $self = shift;
+    my ($operation,$chain,$table,@args) = @_;
+    croak "You must provide a chain name" unless $chain;
+    my $op  = $operation eq 'append' ? '-A'
+	     :$operation eq 'delete' ? '-D'
+	     :$operation eq 'check ' ? '-C'
+	     :$operation eq 'insert' ? '-I'
+	     :'-A';
+    
+    my $command = '';
+    $command   .= "-t $table " if $table;
+    $command   .= "$op $chain ";
+    $command   .= $self->_process_iptable_options(@args);
+    $self->iptables($command);
+}
+
+sub iptables_append {
+    my $self = shift;
+    my ($table,$chain,@args) = @_;
+    $self->_iptables_add_rule('append',$table,$chain,@args);
+}
+
+sub iptables_delete {
+    my $self = shift;
+    my ($table,$chain,@args) = @_;
+    $self->_iptables_add_rule('delete',$table,$chain,@args);
+}
+
+sub iptables_check {
+    my $self = shift;
+    my ($table,$chain,@args) = @_;
+    $self->_iptables_add_rule('check',$table,$chain,@args);
+}
+
+sub iptables_insert {
+    my $self = shift;
+    my ($table,$chain,@args) = @_;
+    $self->_iptables_add_rule('insert',$table,$chain,@args);
+}
+
+=head2 $bal->firewall_rule($chain,$table,@args)
+
+Issue an iptables firewall rule.
+
+ $chain -- The chain to apply the rule to, e.g. "INPUT". 
+ 
+ $table -- The table to apply the rule to, e.g. "nat". Undef defaults to
+           the standard "filter" table.
+
+ @args  -- The other arguments to pass to iptables.
+
+Here is a typical example of blocking incoming connections to port 25:
+
+ $bal->firewall_rule(INPUT=>undef,-p=>'tcp',-dport=>25,-j=>'REJECT');
+
+This will issue the following command:
+
+ iptables -A INPUT -p tcp --dport 25 -j REJECT
+
+The default operation is to append the rule to the chain using
+-A. This can be changed by passing $bal->firewall_op() any of the
+strings "append", "delete", "insert" or "check". Subsequent calls to
+firewall_rule() will return commands for the indicated function:
+
+ $bal->firewall_op('delete');
+ $bal->firewall_rule(INPUT=>undef,-p=>'tcp',-dport=>25,-j=>'REJECT');
+ # gives  iptables -A INPUT -p tcp --dport 25 -j REJECT
+
+If you want to apply a series of deletes and then revert to the
+original append behavior, then it is easiest to localize the hash key
+"firewall_op":
+
+ {
+   local $bal->{firewall_op} = 'delete';
+   $bal->firewall_rule(INPUT=>undef,-dport=>25,-j=>'ACCEPT');
+   $bal->firewall_rule(INPUT->undef,-dport=>80,-j=>'ACCEPT');
+ }
+ 
+   $bal->firewall_rule(INPUT=>undef,-dport=>25,-j=>'DROP');
+   $bal->firewall_rule(INPUT=>undef,-dport=>80,-j=>'DROP');
+
+=cut
+
+sub firewall_rule {
+    my $self = shift;
+    my ($chain,$table,@args) = @_;
+    my $operation = $self->firewall_op();
+    $self->_iptables_add_rule($operation,$chain,$table,@args);
+}
+
+sub firewall_op {
+    my $self = shift;
+    if (@_) {
+	$self->{firewall_op} = shift;
+	return;
+    }
+    my $d = $self->{firewall_op} || 'append';
+    return $d;
+}
+
+=head2 $bal->force_route($service_or_device,@selectors)
+
+The force_route() method issues iptables commands that will force
+certain traffic to travel over a particular ISP service or network
+device. This is useful, for example, when one of your ISPs acts as
+your e-mail relay and only accepts connections from the IP address
+it assigns.
+
+$service_or_device is the symbolic name of an ISP service
+(e.g. "CABLE") or a network device that a service is attached to
+(e.g. "eth0").
+
+@selectors are a series of options that will be passed to
+iptables to select the routing of packets. For example, to forward all
+outgoing mail (destined to port 25) to the "CABLE" ISP, you would
+write:
+
+    $bal->force_route('CABLE','--syn','-p'=>'tcp','--dport'=>25);
+
+@selectors is a series of optional arguments that will be passed to
+iptables on the command line. They will simply be space-separated, and
+so the following is equivalent to the previous example:
+
+    $bal->force_route('CABLE','--syn -p tcp --dport 25');
+
+Bare arguments that begin with a leading hyphen and are followed by
+two or more alphanumeric characters are automatically converted into
+double-hyphen arguments. This allows you to simplify commands
+slightly. The following is equivalent to the previous examples:
+
+    $bal->force_route('CABLE',-syn,-p=>'tcp',-dport=>25);
+
+You can delete force_route rules by setting firewall_op() to 'delete':
+
+    $bal->firewall_op('delete');
+    $bal->force_route('CABLE',-syn,-p=>'tcp',-dport=>25);
+
+=cut
+
+sub force_route {
+    my $self = shift;
+    my ($service_or_device,@selectors) = @_;
+    
+    my $service = $self->_service_or_device($service_or_device)
+	or croak "did not recognize $service_or_device as a service or a device";
+
+    my $dest      = $self->mark_table($service);
+    my $selectors = $self->_process_iptable_options(@selectors);
+    $self->firewall_rule(PREROUTING=>'mangle',$selectors,-j=>$dest);
+}
+
+=head2 $bal->add_route($address => $device, [$masquerade])
+
+This method is used to create routing and firewall rules for a network
+that isn't mentioned in balance.conf. This may be necessary to route
+to VPNs and/or to the control interfaces of attached modems.
+
+The first argument is the network address in CIDR format,
+e.g. '192.168.2.0/24'. The second is the network interface that the
+network can be accessed via. The third, optional, argument is a
+boolean. If true, then firewall rules will be set up to masquerade
+from the LAN into the attached network.
+
+Note that this is pretty limited. If you want to do anything more
+sophisticated you're better off setting the routes and firewall rules
+manually.
+
+=cut
+
+sub add_route {
+    my $self = shift;
+    my ($network,$device,$masquerade) = @_;
+    $network && $device or croak "usage: add_network(\$network,\$device,[\$masquerade])";
+    # add the route to our main table
+    $self->ip_route("add $network dev $device");
+    # add the route to each outgoing table
+    $self->ip_route("add $network dev $device table $_") for map {$self->table($_)} $self->isp_services;
+    
+    # create appropriate firewall rules for the network
+    {
+	local $self->{firewall_op} = 'insert';
+	$self->firewall_rule(OUTPUT => undef,
+			     -o    => $device,
+			     -d    => $network,
+			     -j    => 'ACCEPT');
+	$self->firewall_rule(INPUT => undef,
+			     -i    => $device,
+			     -s    => $network,
+			     -j    => 'ACCEPT');
+	$self->firewall_rule(FORWARD => undef,
+			     -i    => $self->dev($_),
+			     -s    => $self->net($_),
+			     -o    => $device,
+			     -d    => $network,
+			     -j    => 'ACCEPT') for $self->lan_services;
+	$self->firewall_rule(FORWARD => undef,
+			     -i    => $device,
+			     -s    => $network,
+			     -o    => $self->dev($_),
+			     -d    => $self->net($_),
+			     -j    => 'ACCEPT') for $self->lan_services;
+    }
+    if ($masquerade) {
+	$self->firewall_rule(POSTROUTING=>'nat',
+			     -d => $network,
+			     -o => $device,
+			     -j => 'MASQUERADE');
+    }
+}
+
+sub _process_iptable_options {
+    my $self = shift;
+    my @opt  = @_;
+    foreach (@opt) {
+	$_ = "-$_" if /^-\w{2,}/;  # add an extra hyphen to -arguments
+	$_ =~ quotemeta($_);
+    }
+    return join ' ',@opt;
+}
+
+sub _mark {
+    my $self    = shift;
+    my $service = shift;
+    return "MARK-${service}";
+}
+
+=head2 $table_name = $bal->mark_table($service)
+
+This returns the iptables table name for connections marked for output
+on a particular ISP service. The name is simply the word "MARK-"
+appended to the service name. For example, for a service named "DSL",
+the corresponding firewall table will be named "MARK-DSL".
+
+=cut
+
+sub mark_table { shift->_mark(shift) }
+
+sub _service_or_device {
+    my $self = shift;
+    my $sod  = shift;
+    return $sod if $self->dev($sod);
+    # otherwise try looking for devices
+    my %dev2s = map {$self->dev($_) => $_} $self->service_names;
+    return $dev2s{$sod};
+}
+
 =head2 $bal->forward($incoming_port,$destination_host,@protocols)
 
 This method emits appropriate port/host forwarding rules. Destination host can
@@ -359,7 +610,6 @@ sub forward {
 		my $lanip  = $self->ip($lan);
 		my $syn    = $protocol eq 'tcp' ? '--syn' : '';
 		$self->iptables("-A FORWARD -p $protocol -o $landev $syn -d $dhost --dport $dport -j ACCEPT");
-#		$self->iptables("-t nat -A POSTROUTING -p $protocol -d $dhost -o $landev --dport $dport -j SNAT --to $lanip");
 	    }
 	}
     }
@@ -1255,6 +1505,37 @@ sub local_fw_rules {
     $self->_execute_rules_files(@files);
 }
 
+=head2 $bal->pre_run_rules()
+
+This method is called by set_routes_and_firewall() to process the fules and emit
+the commands contained in the customized route files located in
+$ETC_DIR/balance/pre-run.
+
+=cut
+
+sub pre_run_rules {
+    my $self = shift;
+    my $dir  = $self->rules_directory;
+    my @files = sort glob("$dir/pre-run/*");
+    $self->_execute_rules_files(@files);
+}
+
+=head2 $bal->post_run_rules()
+
+This method is called by set__routes_andfirewall() to process the
+fules and emit the commands contained in the customized route files
+located in $ETC_DIR/balance/post-run.
+
+=cut
+
+sub post_run_rules {
+    my $self = shift;
+    my $dir  = $self->rules_directory;
+    my @files = sort glob("$dir/post-run/*");
+    $self->_execute_rules_files(@files);
+}
+
+
 sub _execute_rules_files {
     my $self = shift;
     my @files = @_;
@@ -1358,7 +1639,7 @@ sub balancing_fw_rules {
     print STDERR "# balancing FW rules\n" if $self->verbose;
 
     for my $svc ($self->isp_services) {
-	my $table = "MARK-${svc}";
+	my $table = $self->mark_table($svc);
 	my $mark  = $self->fwmark($svc);
 	next unless defined $mark && defined $table;
 	$self->sh(<<END);
@@ -1379,7 +1660,7 @@ END
 	    my $count = @up;
 	    my $i = 1;
 	    for my $svc (@up) {
-		my $table = "MARK-${svc}";
+		my $table       = $self->mark_table($svc);
 		my $probability = 1/$i++; # 1, 1/2, 1/3, 1/4...
 		$self->iptables("-t mangle -A PREROUTING -i $landev -m conntrack --ctstate NEW -m statistic --mode random --probability $probability -j $table");
 	    }
@@ -1388,7 +1669,8 @@ END
 	else {
 	    my $svc = $up[0];
 	    print STDERR "# forcing all traffic through $svc\n" if $self->verbose;
-	    $self->iptables("-t mangle -A PREROUTING -i $landev -m conntrack --ctstate NEW -j MARK-${svc}");
+	    my $table  = $self->mark_table($svc);
+	    $self->iptables("-t mangle -A PREROUTING -i $landev -m conntrack --ctstate NEW -j $table");
 	}
 
 	$self->iptables("-t mangle -A PREROUTING -i $landev -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark");
@@ -1396,8 +1678,9 @@ END
 
     # inbound packets from WAN
     for my $wan ($self->isp_services) {
-	my $dev = $self->dev($wan);
-	$self->iptables("-t mangle -A PREROUTING -i $dev -m conntrack --ctstate NEW -j MARK-${wan}");
+	my $dev   = $self->dev($wan);
+	my $table = $self->mark_table($wan);
+	$self->iptables("-t mangle -A PREROUTING -i $dev -m conntrack --ctstate NEW -j $table");
 	$self->iptables("-t mangle -A PREROUTING -i $dev -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark");
     }
 
