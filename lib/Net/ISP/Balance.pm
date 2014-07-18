@@ -8,7 +8,7 @@ use Carp 'croak','carp';
 eval 'use Net::Netmask';
 eval 'use Net::ISP::Balance::ConfigData';
 
-our $VERSION    = '1.04';
+our $VERSION    = '1.05';
 
 =head1 NAME
 
@@ -1126,14 +1126,14 @@ sub _collect_interfaces {
     }
 
     my $counter = 0;
-    for my $dev (keys %$iface_type) {
-	my $svc     = $devs{$dev} or next;
+    for my $dev (keys %devs) {
+	my $svc     = $devs{$dev};
 	my $role  = $svc ? $s->{$svc}{role} : '';
 	my $type  = $iface_type->{$dev};
 	my $info = $type eq 'static' ? $self->get_static_info($dev,$gateways->{$dev})
 	          :$type eq 'dhcp'   ? $self->get_dhcp_info($dev)
 	          :$type eq 'ppp'    ? $self->get_ppp_info($dev)
-		  :undef;
+		  :$self->guess_interface_info($dev);  # HACK FOR VPN tun0/tap0!! FIX!!!
 	$info ||= {dev=>$dev,running=>0}; # not running
 	$info or die "Couldn't figure out how to get info from $dev";
 	if ($role eq 'isp') {
@@ -1237,7 +1237,7 @@ sub get_ppp_info {
     my ($peer)   = $ifconfig =~ /P-t-P:(\S+)/;
     my ($mask)   = $ifconfig =~ /Mask:(\S+)/;
     my $up       = $ifconfig =~ /^\s+UP\s/m;
-    my $block    = Net::Netmask->new($peer,$mask);
+    my $block    = Net::Netmask->new2($peer,$mask) or die $Net::Netmask::error;
     return {running  => $up,
 	    dev => $device,
 	    ip  => $ip,
@@ -1246,7 +1246,39 @@ sub get_ppp_info {
 	    fwmark => undef,};
 }
 
-=head2 $info = $bal->get_static_info($deb)
+# this subroutine gets called when there is no information in the interfaces table
+sub guess_interface_info {
+    my $self   = shift;
+    my $device = shift;
+    my $ifconfig = $self->_ifconfig($device) or return;
+    return $self->get_ppp_info($device)
+	if $ifconfig =~ /P-t-P/;
+    # otherwise we get the static info and then supplement
+    # with probing of the route table
+    my $r = $self->get_static_info($device,undef);
+    $r->{gw} = $self->_guess_gateway($device);  # this needs work
+    return;
+}
+
+sub _guess_gateway {
+    my $self = shift;
+    my $device = shift;
+
+    my ($current_network,%gateways);
+
+    open my $fh,"ip route show all |" or die "ip route: $!";
+    while (<$fh>) {
+	chomp;
+	$current_network = $1 if /^(\S+)/;
+	my ($destination_net,$gateway,$dev) = 
+	    /(\S+)\s+via\s+(\S+)\s+dev\s+(\w+)/ or next;
+	$destination_net = $current_network if $destination_net eq 'nexthop';
+	$gateways{$dev} = $gateway;
+    }
+    return $gateways{$device};
+}
+
+=head2 $info = $bal->get_static_info($device,$gw)
 
 This nmethod returns a hashref containing information about a
 statically-defined network interface device, including IP address,
@@ -1263,7 +1295,7 @@ sub get_static_info {
     my ($addr)   = $ifconfig =~ /inet addr:(\S+)/;
     my $up       = $ifconfig =~ /^\s+UP\s/m;
     my ($mask)   = $ifconfig =~ /Mask:(\S+)/;
-    my $block    = Net::Netmask->new($addr,$mask);
+    my $block    = Net::Netmask->new2($addr,$mask) or die $Net::Netmask::error;
     return {running  => $up,
 	    dev => $device,
 	    ip  => $addr,
@@ -1311,7 +1343,7 @@ sub get_dhcp_info {
 	unless defined($ip) && defined($gw) && defined($netmask);
 
     my $up       = $ifconfig =~ /^\s+UP\s/m;
-    my $block = Net::Netmask->new($ip,$netmask);
+    my $block = Net::Netmask->new2($ip,$netmask) or die $Net::Netmask::error;
     return {running  => $up,
 	    dev => $device,
 	    ip  => $ip,
@@ -1575,9 +1607,11 @@ sub base_fw_rules {
     my $self = shift;
     $self->sh(<<END);
 iptables -F
-iptables -t nat    -F
-iptables -t mangle -F
 iptables -X
+iptables -t nat    -F
+iptables -t nat    -X
+iptables -t mangle -F
+iptables -t mangle -X
 iptables -P INPUT    DROP
 iptables -P OUTPUT   DROP
 iptables -P FORWARD  DROP
