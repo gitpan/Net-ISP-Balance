@@ -1,14 +1,13 @@
 package Net::ISP::Balance;
 
 use strict;
-use IO::String;
 use Fcntl ':flock';
 use Carp 'croak','carp';
 
 eval 'use Net::Netmask';
 eval 'use Net::ISP::Balance::ConfigData';
 
-our $VERSION    = '1.05';
+our $VERSION    = '1.06';
 
 =head1 NAME
 
@@ -50,6 +49,7 @@ Net::ISP::Balance - Support load balancing across multiple internet service prov
     print $bal->fwmark($s);
     print $bal->table($s);
     print $bal->running($s);
+    print $bal->weight($s);
  }
 
 =cut
@@ -69,7 +69,7 @@ at http://lstein.github.io/Net-ISP-Balance/.
 Here are the class methods for this module that can be called on the
 class name.
 
-=head2 $bal = Net::ISP::Balance->new('/path/to/config_file.conf','/path/to/interfaces');
+=head2 $bal = Net::ISP::Balance->new('/path/to/config_file.conf');
 
 Creates a new balancer object. 
 
@@ -79,18 +79,13 @@ systems, and /etc/sysconfig/network-scripts/balance.conf on
 RedHat/CentOS-derived systems. From hereon, we'll refer to the base of
 the various configuration files as $ETC_NETWORK.
 
-The second optional argument is the system network interfaces file,
-defaulting to $ETC_NETWORK/interfaces.
-
 =cut
 
 sub new {
     my $class = shift;
-    my ($conf,$interfaces,$dummy_test_data)  = @_;
+    my ($conf,$dummy_test_data)  = @_;
     $conf       ||= $class->default_conf_file;
-    $interfaces ||= $class->default_interface_file;
     $conf       && -r $conf       || croak 'Must provide a readable configuration file path';
-    $interfaces && -r $interfaces || croak 'Must provide a readable network interfaces path';
     my $self  = bless {
 	verbose   => 0,
 	echo_only => 0,
@@ -99,11 +94,11 @@ sub new {
 	lsm_conf_file   => $class->default_lsm_conf_file,
 	lsm_scripts_dir => $class->default_lsm_scripts_dir,
 	bal_conf_file   => $conf,
-	dummy_data=>$dummy_test_data,
+	dummy_data      => $dummy_test_data,
     },ref $class || $class;
 
     $self->_parse_configuration_file($conf);
-    $self->_collect_interfaces($interfaces);
+    $self->_collect_interfaces_retry(10);  # try to collect interfaces over 10 seconds
 
     return $self;
 }
@@ -320,9 +315,9 @@ my %seen_rule;
 sub iptables {
     my $self = shift;
     if (ref $_[0] eq 'ARRAY') {
-	$seen_rule{$_}++ || $self->sh('iptables',$_) foreach @{$_[0]};
+	$seen_rule{$_}++   || $self->sh('iptables',$_) foreach @{$_[0]};
     } else {
-	$seen_rule{"@_"} || $self->sh('iptables',@_)
+	$seen_rule{"@_"}++ || $self->sh('iptables',@_)
     }
 }
 
@@ -660,7 +655,7 @@ Return the list of service names defined in balance.conf.
 sub service_names {
     my $self = shift;
     my $s    = $self->services;
-    return keys %$s;
+    return sort keys %$s;
 }
 
 =head2 @names = $bal->isp_services
@@ -734,6 +729,51 @@ sub event {
     my @up = grep {$state{$_} eq 'up'} keys %state;
     $self->up(@up);
     return \%state;
+}
+
+=head2 $bal->run_eventd(@args)
+
+Runs scripts in response to lsm events. The scripts are stored in
+directories named after the events, e.g.:
+
+ /etc/network/lsm/up.d/*
+ /etc/network/lsm/down.d/*
+ /etc/network/lsm/long_down.d/*
+
+Scripts are called with the following arguments:
+
+  0. STATE
+  1. SERVICE NAME
+  2. CHECKIP
+  3. DEVICE
+  4. WARN_EMAIL
+  5. REPLIED
+  6. WAITING
+  7. TIMEOUT
+  8. REPLY_LATE
+  9. CONS_RCVD
+ 10. CONS_WAIT
+ 11. CONS_MISS
+ 12. AVG_RTT
+ 13. SRCIP
+ 14. PREVSTATE
+ 15. TIMESTAMP
+
+=cut
+
+sub run_eventd {
+    my $self = shift;
+    my @args = @_;
+    my $state = $args[0];
+    my $dir  = $self->lsm_scripts_dir();
+    my $dird = "$dir/${state}.d";
+    my @files = sort glob("$dird/*");
+    for my $script (@files) {
+	next if $script =~ /^#/;
+	next if $script =~ /~$/;
+	next unless -f $script && -x _;
+	system $script,@args;
+    }    
 }
 
 =head2 @up = $bal->up(@up_services)
@@ -838,11 +878,12 @@ sub dev { shift->_service_field(shift,'dev') }
 sub ip  { shift->_service_field(shift,'ip')  }
 sub gw  { shift->_service_field(shift,'gw')  }
 sub net { shift->_service_field(shift,'net')  }
-sub running { shift->_service_field(shift,'running')  }
-sub role   { shift->_service_field(shift,'role')  }
-sub fwmark { shift->_service_field(shift,'fwmark')  }
-sub table { shift->_service_field(shift,'table')  }
-sub ping   { shift->_service_field(shift,'ping')  }
+sub running  { shift->_service_field(shift,'running')  }
+sub role     { shift->_service_field(shift,'role')  }
+sub fwmark   { shift->_service_field(shift,'fwmark')  }
+sub table    { shift->_service_field(shift,'table')  }
+sub ping     { shift->_service_field(shift,'ping')  }
+sub weight   { shift->_service_field(shift,'weight')  }
 
 sub _service_field {
     my $self = shift;
@@ -883,23 +924,6 @@ $ETC_NETWORK/balance.conf.
 sub default_conf_file {
     my $self = shift;
     return $self->install_etc.'/balance.conf';
-}
-
-=head2 $file_or_dir = Net::ISP::Balance->default_interface_file
-
-Returns the path to the place where the system stores its network
-configuration information. On Ubuntu/Debian-derived systems, this will
-be the file /etc/network/interfaces. On RedHad/CentOS-derived systems,
-this is the directory named /etc/sysconfig/network-scripts/ which
-contains a series of ifcfg-* files.
-
-=cut
-
-sub default_interface_file {
-    my $self = shift;
-    return '/etc/network/interfaces'        if -d '/etc/network';
-    return '/etc/sysconfig/network-scripts' if -d '/etc/sysconfig/network-scripts';
-    die "I don't know where to find network interface configuration files on this system";
 }
 
 =head2 $dir = Net::ISP::Balance->default_rules_directory
@@ -1012,7 +1036,8 @@ file.
 Possible switches and their defaults are:
 
     -checkip                    127.0.0.1
-    -eventscript                /etc/network/lsm/balancer_event_script
+    -eventscript                /etc/network/load_balance.pl
+    -long_down_eventscript      /etc/network/load_balance.pl
     -notifyscript               /etc/network/lsm/default_script
     -max_packet_loss            15
     -max_successive_pkts_lost    7
@@ -1023,7 +1048,7 @@ Possible switches and their defaults are:
     -warn_email               root
     -check_arp                   0
     -sourceip                 <autodiscovered>
-    -device                   <autodiscovered>
+    -device                   <autodiscovered>                      -eventscript          => $balance_script,
     -ttl                      0 <use system value>
     -status                   2 <no assumptions>
     -debug                    8 <moderate verbosity from scale of 0 to 100>
@@ -1038,7 +1063,8 @@ sub lsm_config_text {
     my %defaults = (
                       -checkip              => '127.0.0.1',
                       -debug                => 8,
-                      -eventscript          => $balance_script,
+                      -eventscript            => $balance_script,
+                      -long_down_eventscript  => $balance_script,
                       -notifyscript         => "$scripts_dir/default_script",
                       -max_packet_loss      => 15,
                       -max_successive_pkts_lost =>  7,
@@ -1046,6 +1072,7 @@ sub lsm_config_text {
                       -min_successive_pkts_rcvd =>  10,
                       -interval_ms              => 1000,
                       -timeout_ms               => 1000,
+	              -long_down_time           => 120,
                       -warn_email               => 'root',
                       -check_arp                =>  0,
                       -sourceip                 => undef,
@@ -1096,302 +1123,146 @@ sub _parse_configuration_file {
 	    $lsm_options{"-${1}"} = $2;
 	    next;
 	}
-	my ($service,$device,$role,$ping_dest) = split /\s+/;
+	my ($service,$device,$role,$ping_dest,$weight) = split /\s+/;
 	next unless $service && $device && $role;
 	croak "load_balance.conf line $.: A service can not be named 'up' or 'down'"
 	    if $service=~/^(up|down)$/;
-	$services{$service}{dev}=$device;
-	$services{$service}{role}=$role;
-	$services{$service}{ping}=$ping_dest;
+	$services{$service}{dev}   = $device;
+	$services{$service}{role}  = $role;
+	$services{$service}{ping}  = $ping_dest  || 'www.google.ca';
+	$services{$service}{weight}= $weight     || 1;
     }
     close $f;
     $self->{svc_config}=\%services;
     $self->{lsm_config}=\%lsm_options;
 }
 
+sub _collect_interfaces_retry {
+    my $self    = shift;
+    my $retries = 10;
+    my $ifs;
+    for (1..$retries) {
+	$ifs = eval{$self->_collect_interfaces()};
+	last if $ifs;
+	sleep 1;
+    }
+    croak "Could not get information on all interfaces after $retries s; last error was $@" unless $ifs;
+    $self->{services} = $ifs;
+}
+
 sub _collect_interfaces {
     my $self = shift;
-    my $interfaces = shift;
     my $s    = $self->{svc_config} or return;
 
-    my ($iface_type,$gateways) = -f $interfaces ? $self->_get_debian_ifcfg($interfaces)   # 'network/interfaces' file
-                                                : $self->_get_centos_ifcfg($interfaces);  # 'network-scripts/ifcfg-*' files
-                               
-    my (%ifaces,%devs);
+    # get interfaces with assigned addresses
+    my $a    = $self->_ip_addr_show;
+    my (undef,@ifs)  = split /^\d+: /m,$a;
+    chomp(@ifs);
+    my %ifs = map {split(/: /,$_,2)} @ifs;
 
+    # get existing routes
+    my (%gws,%nets);
+    my $r    = $self->_ip_route_show;
+    my @routes = split /^(?!\s)/m,$r;
+    chomp(@routes);
+    foreach (@routes) {
+	while (/(\S+)\s+via\s+(\S+)\s+dev\s+(\w+)/g) {
+	    my ($net,$gateway,$dev) = ($1,$2,$3);
+	    ($net) = /^(\S+)/ if $net eq 'nexthop';
+	    $nets{$dev} = $net unless $net eq 'default';
+	    $gws{$dev}  = $gateway;
+	}
+    }
+                               
     # map devices to services
+    my %devs;
     for my $svc (keys %$s) {
 	my $dev = $s->{$svc}{dev};
 	$devs{$dev}=$svc;
     }
 
+    my %ifaces;
     my $counter = 0;
-    for my $dev (keys %devs) {
-	my $svc     = $devs{$dev};
-	my $role  = $svc ? $s->{$svc}{role} : '';
-	my $type  = $iface_type->{$dev};
-	my $info = $type eq 'static' ? $self->get_static_info($dev,$gateways->{$dev})
-	          :$type eq 'dhcp'   ? $self->get_dhcp_info($dev)
-	          :$type eq 'ppp'    ? $self->get_ppp_info($dev)
-		  :$self->guess_interface_info($dev);  # HACK FOR VPN tun0/tap0!! FIX!!!
-	$info ||= {dev=>$dev,running=>0}; # not running
-	$info or die "Couldn't figure out how to get info from $dev";
-	if ($role eq 'isp') {
-	    $counter++;
-	    $info->{fwmark} = $counter;
-	    $info->{table}  = $counter;
-	}
-	# next unless $info->{running};  # maybe we should do this?
-	$info->{ping} = $s->{$svc}{ping};
-	$info->{role} = $role;
-	$ifaces{$svc}=$info;
+    for my $dev (sort keys %devs) {
+	my $info      = $ifs{$dev} or next;
+	my $svc       = $devs{$dev};
+	my $role      = $s->{$svc}{role};
+	my $running   = $info =~ /[<,]UP[,>]/;
+	my ($addr,$bits)= $info =~ /inet (\d+\.\d+\.\d+\.\d+)(?:\/(\d+))?/;
+	$bits ||= 32;
+	my ($peer)      = $info =~ /peer\s+(\d+\.\d+\.\d+\.\d+)/;
+	my $block       = Net::Netmask->new2("$addr/$bits") or die "unable to derive address for $dev: $Net::Netmask::error\nifconfig = \n$info";
+	my $gw          = $gws{$dev}  || $peer                    || $self->_dhcp_gateway($dev) || $block->nth(1);
+	my $net         = $nets{$dev} || ($peer?"$peer/32":undef) || "$block";
+	$ifaces{$svc} = {
+	    dev     => $dev,
+	    running => $running,
+	    gw      => $gw,
+	    net     => $net,
+	    ip      => $addr,
+	    fwmark  => $role eq 'isp' ? ++$counter : undef,
+	    table   => $role eq 'isp' ?   $counter : undef,
+	    role    => $role,
+	    ping    => $s->{$svc}{ping},
+	    weight  => $s->{$svc}{weight},
+	};
     }
-    $self->{services} = \%ifaces;
+    return \%ifaces;
 }
 
-sub _get_debian_ifcfg {
+sub _ip_addr_show {
     my $self = shift;
-    my $interfaces = shift;
-
-    my (%iface_type,%gw,$lastdev);
-    
-    # use /etc/network/interfaces to figure out what kind of
-    # device each is.
-    open my $f,$interfaces or die "$interfaces: $!";
-    while (<$f>) {
-	chomp;
-	if (/^\s*iface\s+(\w+)\s+inet\s+(\w+)/) {
-	    $iface_type{$1} = $2;
-	    $lastdev        = $1;
-	}
-	if (/^\s*gateway\s+(\S+)/ && $lastdev) {
-	    $gw{$lastdev}   = $1;
-	}
-    }
-    close $f;
-    return (\%iface_type,\%gw);
+    return $self->{dummy_data}{"ip_addr_show"} || `ip addr show`;
 }
 
-sub _get_centos_ifcfg {
+sub _ip_route_show {
     my $self = shift;
-    my $interfaces = shift;
-
-    my (%ifcfg,%iface_type,%gw);
-
-    # collect all "ifcfg-* files";
-    opendir my $dh,$interfaces or die "Can't open $interfaces for reading: $!";
-    while (my $entry = readdir($dh)) {
-	next if $entry =~ /^\./;
-	next unless $entry =~ /ifcfg-(?:Auto_)?(\w+)$/;
-	$ifcfg{$entry} = $1;
-    }
-    closedir $dh;
-    for my $entry (keys %ifcfg) {
-	my $file = "$interfaces/$entry";
-	my $dev  = $ifcfg{$entry};
-	my $realdevice;
-	open my $fh,$file or die "$file: $!";
-	while (<$fh>) {
-	    chomp;
-	    if (/^GATEWAY\s*=\s*(\S+)/) {
-		$gw{$dev}=$1;
-	    }
-	    if (/^BOOTPROTO\s*=\s*(\w+)/) {
-		$iface_type{$dev} = $1 eq 'dhcp' ? 'dhcp' : 'static';
-	    }
-	    if (/^DEVICE\s*=\s*(\w+)/) {
-		$realdevice = $1;
-	    }
-	}
-	$iface_type{$dev} = 'ppp' if $dev =~ /^ppp\d+/;  # hack 'cause no other way to figure it out
-	close $fh;
-
-	# I don't know if this can happen in RHL/CentOS, but ifcfg* files can
-	# have a DEVICE entry that may not necessarily match the file name. Arrrgh!
-	if ($realdevice && $realdevice ne $dev) {
-	    $iface_type{$realdevice}=$iface_type{$dev};
-	    $gw{$realdevice}=$gw{$realdevice};
-	    delete $iface_type{$dev};
-	    delete $gw{$dev};
-	}
-
-    }
-
-    return (\%iface_type,\%gw);
+    return $self->{dummy_data}{"ip_route_show"} || `ip route show all`;
 }
 
-=head2 $info = $bal->get_ppp_info($dev)
-
-This nmethod returns a hashref containing information about a PPP
-network interface device, including IP address, gateway, network, and
-netmask. The $dev argument is a standard Linux network device name
-such as "ppp0".
-
-=cut
-
-sub get_ppp_info {
-    my $self     = shift;
-    my $device   = shift;
-    my $ifconfig = $self->_ifconfig($device) or return;
-    my ($ip)     = $ifconfig =~ /inet addr:(\S+)/;
-    my ($peer)   = $ifconfig =~ /P-t-P:(\S+)/;
-    my ($mask)   = $ifconfig =~ /Mask:(\S+)/;
-    my $up       = $ifconfig =~ /^\s+UP\s/m;
-    my $block    = Net::Netmask->new2($peer,$mask) or die $Net::Netmask::error;
-    return {running  => $up,
-	    dev => $device,
-	    ip  => $ip,
-	    gw  => $peer,
-	    net => "$block",
-	    fwmark => undef,};
-}
-
-# this subroutine gets called when there is no information in the interfaces table
-sub guess_interface_info {
-    my $self   = shift;
-    my $device = shift;
-    my $ifconfig = $self->_ifconfig($device) or return;
-    return $self->get_ppp_info($device)
-	if $ifconfig =~ /P-t-P/;
-    # otherwise we get the static info and then supplement
-    # with probing of the route table
-    my $r = $self->get_static_info($device,undef);
-    $r->{gw} = $self->_guess_gateway($device);  # this needs work
-    return;
-}
-
-sub _guess_gateway {
+# This subroutine is called for dhcp-assigned IP addresses to try to
+# get the gateway. It is used for those unusual cases in which the gateway
+# is NOT the first IP address in the net block.
+# In versions 1.05 and older, we tried to recover this information on static
+# interfaces by reading /etc/network/interfaces as well, but the file location was too
+# unpredictable across different Linux distros.
+sub _dhcp_gateway {
     my $self = shift;
-    my $device = shift;
-
-    my ($current_network,%gateways);
-
-    open my $fh,"ip route show all |" or die "ip route: $!";
+    my $dev  = shift;
+    my $fh       = $self->_open_dhclient_leases($dev) or return;
+    my ($gw);
     while (<$fh>) {
-	chomp;
-	$current_network = $1 if /^(\S+)/;
-	my ($destination_net,$gateway,$dev) = 
-	    /(\S+)\s+via\s+(\S+)\s+dev\s+(\w+)/ or next;
-	$destination_net = $current_network if $destination_net eq 'nexthop';
-	$gateways{$dev} = $gateway;
+        chomp;
+	$gw = $1 if /option routers (\S+)[,;]/;
     }
-    return $gateways{$device};
-}
-
-=head2 $info = $bal->get_static_info($device,$gw)
-
-This nmethod returns a hashref containing information about a
-statically-defined network interface device, including IP address,
-gateway, network, and netmask. The $dev argument is a standard Linux
-network device name such as "etho0".
-
-=cut
-
-
-sub get_static_info {
-    my $self     = shift;
-    my ($device,$gw) = @_;
-    my $ifconfig = $self->_ifconfig($device) or return;
-    my ($addr)   = $ifconfig =~ /inet addr:(\S+)/;
-    my $up       = $ifconfig =~ /^\s+UP\s/m;
-    my ($mask)   = $ifconfig =~ /Mask:(\S+)/;
-    my $block    = Net::Netmask->new2($addr,$mask) or die $Net::Netmask::error;
-    return {running  => $up,
-	    dev => $device,
-	    ip  => $addr,
-	    gw  => $gw || $block->nth(1),
-	    net => "$block",
-	    fwmark => undef,};
-}
-
-=head2 $info = $bal->get_dhcp_info($deb)
-
-This nmethod returns a hashref containing information about a network
-interface device that is configured via dhcp, including IP address,
-gateway, network, and netmask. The $dev argument is a standard Linux
-network device name such as "eth0".
-
-=cut
-
-sub get_dhcp_info {
-    my $self     = shift;
-    my $device   = shift;
-    my $fh       = $self->_open_dhclient_leases($device) or die "Can't find lease file for $device";
-    my $ifconfig = $self->_ifconfig($device)             or die "Can't ifconfig $device";
-
-    my ($ip,$gw,$netmask);
-    while (<$fh>) {
-	chomp;
-
-	if (/fixed-address (\S+);/) {
-	    $ip = $1;
-	    next;
-	}
-	
-	if (/option routers (\S+)[,;]/) {
-	    $gw = $1;
-	    next;
-	}
-
-	if (/option subnet-mask (\S+);/) {
-	    $netmask = $1;
-	    next;
-	}
-    }
-
-    die "Couldn't find all required information" 
-	unless defined($ip) && defined($gw) && defined($netmask);
-
-    my $up       = $ifconfig =~ /^\s+UP\s/m;
-    my $block = Net::Netmask->new2($ip,$netmask) or die $Net::Netmask::error;
-    return {running  => $up,
-	    dev => $device,
-	    ip  => $ip,
-	    gw  => $gw,
-	    net => "$block",
-	    fwmark => undef,
-    };
-}
-
-=head2 $path = $bal->find_dhclient_leases($dev)
-
-This method finds the dhclient configuration file corresponding to
-DHCP-managed device $dev. The device is a standard device name such as
-"eth0".
-
-=cut
-
-sub find_dhclient_leases {
-    my $self     = shift;
-    my $device = shift;
-    my @locations = ('/var/lib/NetworkManager','/var/lib/dhcp','/var/lib/dhclient');
-    for my $l (@locations) {
-	my @matches = glob("$l/dhclient*$device.lease*");
-	next unless @matches;
-	return $matches[0];
-    }
-    return;
+    return $gw;
 }
 
 sub _open_dhclient_leases {
     my $self = shift;
     my $device = shift;
     if (my $dummy = $self->{dummy_data}{"leases_$device"}) {
-	return IO::String->new($dummy);
+	open my $fh,'<',\$dummy or die $!;
+        return $fh;
     }
-    my $leases = $self->find_dhclient_leases($device) or die "Can't find lease file for $device";
+    my $leases = $self->_find_dhclient_leases($device) or return;
     open my $fh,$leases or die "Can't open $leases: $!";
     return $fh;
 }
 
-sub _ifconfig {
-    my $self   = shift;
+sub _find_dhclient_leases {
+    my $self     = shift;
     my $device = shift;
-    if (my $dummy = $self->{dummy_data}{"ifconfig_$device"}) {
-	return $dummy;
+    my @locations = ('/var/lib/NetworkManager','/var/lib/dhcp','/var/lib/dhclient');
+    for my $l (@locations) {
+        my @matches = glob("$l/dhclient*$device.lease*");
+        next unless @matches;
+        return $matches[0];
     }
-    return `ifconfig $device`;
+    return;
 }
+
+
 
 #################################### here are the routing rules ###################
 
@@ -1478,9 +1349,10 @@ sub _create_default_route {
 	#                                   nexthop via 192.168.11.1 dev eth1 weight 1
 	my $hops = '';
 	for my $svc (@up) {
-	    my $gw  = $self->gw($svc)  or next;
-	    my $dev = $self->dev($svc) or next;
-	    $hops  .= "nexthop via $gw dev $dev weight 1 ";
+	    my $gw     = $self->gw($svc)     or next;
+	    my $dev    = $self->dev($svc)    or next;
+	    my $weight = $self->weight($svc) or next;
+	    $hops  .= "nexthop via $gw dev $dev weight $weight ";
 	}
 	die "no valid gateways!" unless $hops;
 	$self->ip_route("add default scope global $hops");
@@ -1692,10 +1564,10 @@ END
 	if (@up > 1) {
 	    print STDERR "# creating balanced mangling rules\n" if $self->verbose;
 	    my $count = @up;
-	    my $i = 1;
+	    my $probabilities = $self->_weight_to_probability(\@up);
 	    for my $svc (@up) {
 		my $table       = $self->mark_table($svc);
-		my $probability = 1/$i++; # 1, 1/2, 1/3, 1/4...
+		my $probability = $probabilities->{$svc};
 		$self->iptables("-t mangle -A PREROUTING -i $landev -m conntrack --ctstate NEW -m statistic --mode random --probability $probability -j $table");
 	    }
 	}
@@ -1718,6 +1590,28 @@ END
 	$self->iptables("-t mangle -A PREROUTING -i $dev -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark");
     }
 
+}
+
+sub _weight_to_probability {
+    my $self = shift;
+    my $svcs = shift;
+
+    # first turn weights into proportions of the total
+    my %weights = map {$_ => $self->weight($_)} @$svcs;
+    my $total   = 0;
+    $total     += $_ foreach (values %weights);
+    my %proportions = map {$_ => $weights{$_}/$total} keys %weights;
+
+    # now turn them into probabilities
+    my %probabilities;
+
+    my $last   = 0;
+    for (sort {$proportions{$a}<=>$proportions{$b} || $a cmp $b} keys %proportions) {
+	my $threshold = $proportions{$_}/(1-$last);
+	$last        += $proportions{$_};
+	$probabilities{$_} = $threshold;
+    }
+    return \%probabilities;
 }
 
 =head2 $bal->sanity_fw_rules()
@@ -1782,8 +1676,8 @@ sub sanity_fw_rules {
 	# allow lan/wan forwarding
 	for my $svc ($self->isp_services) {
 	    my $ispdev = $self->dev($svc);
-	    $self->iptables(["-A FORWARD  -i $dev -o $ispdev -s $net ! -d $net -j ACCEPT",
-			     "-A OUTPUT   -o $ispdev                 ! -d $net -j ACCEPT"]);
+	    $self->iptables("-A FORWARD -i $dev -o $ispdev -s $net -j ACCEPT");
+	    $self->iptables("-A OUTPUT -o $ispdev -j ACCEPT");
 	}
     }
 
@@ -1793,8 +1687,8 @@ sub sanity_fw_rules {
 	my $lan1 = $lans[$i];
 	my $lan2 = $lans[$i+1];
 	next unless $lan2;
-	$self->iptables('-A FORWARD -i',$self->dev($lan1),'-o',$self->dev($lan2),'-s',$self->net($lan1),'-j ACCEPT');
-	$self->iptables('-A FORWARD -o',$self->dev($lan1),'-i',$self->dev($lan2),'-s',$self->net($lan2),'-j ACCEPT');
+	$self->iptables('-A FORWARD','-i',$self->dev($lan1),'-o',$self->dev($lan2),'-s',$self->net($lan1),'-d',$self->net($lan2),'-j ACCEPT');
+	$self->iptables('-A FORWARD','-i',$self->dev($lan2),'-o',$self->dev($lan1),'-s',$self->net($lan2),'-d',$self->net($lan1),'-j ACCEPT');
     }
 
     # anything else is bizarre and should be dropped

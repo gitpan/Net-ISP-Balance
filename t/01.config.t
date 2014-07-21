@@ -5,85 +5,70 @@
 
 use strict;
 use FindBin '$Bin';
-use IO::String;
 use lib $Bin,"$Bin/../lib";
 
-use Test::More tests=>35;
+use Test::More tests=>36;
 
-my $ifconfig_eth0=<<'EOF';
-eth0      Link encap:Ethernet  HWaddr 00:02:cb:88:4f:11  
-          inet addr:191.3.88.152  Bcast:255.255.255.255  Mask:255.255.255.224
-          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-          RX packets:15112298 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:14837376 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:1000 
-          RX bytes:11487635977 (11.4 GB)  TX bytes:7073254884 (7.0 GB)
+my $dummy_data = {
+    ip_addr_show =><<'EOF',
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN 
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000
+    link/ether 00:01:c0:08:3e:38 brd ff:ff:ff:ff:ff:ff
+    inet 191.3.88.152/27 brd 255.255.255.255 scope global eth0
+    inet6 fe80::201:c0ff:fe08:3e38/64 scope link 
+       valid_lft forever preferred_lft forever
+3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000
+    link/ether 00:01:c0:08:3e:39 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.10.1/24 brd 192.168.10.255 scope global eth1
+    inet6 fe80::201:c0ff:fe08:3e39/64 scope link 
+       valid_lft forever preferred_lft forever
+4: eth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000
+    link/ether 48:f8:b3:2e:f6:b2 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.11.11/24 brd 192.168.11.255 scope global eth2
+    inet6 fe80::4af8:b3ff:fe2e:f6b2/64 scope link 
+       valid_lft forever preferred_lft forever
+5: wlan0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN qlen 1000
+    link/ether 00:0d:f0:63:95:61 brd ff:ff:ff:ff:ff:ff
+6: eth3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000
+    link/ether 48:f8:b3:2e:f6:b2 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.12.1/24 brd 192.168.12.255 scope global eth3
+    inet6 fe80::4af8:b3ff:fe2e:f6b2/64 scope link 
+       valid_lft forever preferred_lft forever
+7: ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1492 qdisc pfifo_fast state UNKNOWN qlen 3
+    link/ppp 
+    inet 11.120.199.108 peer 112.211.154.198/32 scope global ppp0
+31: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UNKNOWN qlen 100
+    link/none 
+    inet 10.8.0.1 peer 10.8.0.2/32 scope global tun0
 EOF
-my $ifconfig_ppp0=<<'EOF';
-ppp0      Link encap:Point-to-Point Protocol  
-          inet addr:11.120.199.108  P-t-P:112.211.154.198  Mask:255.255.255.255
-          UP POINTOPOINT RUNNING NOARP MULTICAST  MTU:1492  Metric:1
-          RX packets:8804785 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:6320295 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:3 
-          RX bytes:4657479012 (4.6 GB)  TX bytes:3419043901 (3.4 GB)
+
+    ip_route_show =><<'EOF',
+default
+	nexthop via 112.211.154.198  dev ppp0 weight 1
+	nexthop via 191.3.88.1 dev eth0 weight 1
+10.8.0.0/24 via 10.8.0.2 dev tun0 
+10.8.0.2 dev tun0  proto kernel  scope link  src 10.8.0.1 
+192.168.1.0/24 dev eth2  scope link 
+192.168.2.0/24 dev eth1  scope link  src 192.168.2.1 
+191.3.88.152 dev eth0  scope link 
+191.3.88.150/27 dev eth0  scope link  src 191.3.88.152
+112.211.154.198 dev ppp0  scope link  src 11.120.199.108
 EOF
-my $ifconfig_eth1=<<'EOF';
-eth1      Link encap:Ethernet  HWaddr 00:02:8f:91:11:11  
-          inet addr:192.168.10.1  Bcast:192.168.10.255  Mask:255.255.255.0
-          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-          RX packets:24780338 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:25389079 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:1000 
-          RX bytes:10860168129 (10.8 GB)  TX bytes:19336447379 (19.3 GB)
-EOF
-my $ifconfig_eth2=<<'EOF';
-eth2      Link encap:Ethernet  HWaddr 00:02:8f:91:11:12  
-          inet addr:192.168.11.11  Bcast:192.168.11.255  Mask:255.255.255.0
-          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-          RX packets:24780338 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:25389079 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:1000 
-          RX bytes:10860168129 (10.8 GB)  TX bytes:19336447379 (19.3 GB)
-EOF
-my $ifconfig_eth3=<<'EOF';
-eth3      Link encap:Ethernet  HWaddr 00:02:8f:91:11:13  
-          inet addr:192.168.12.1  Bcast:192.168.12.255  Mask:255.255.255.0
-          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-          RX packets:24780338 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:25389079 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:1000 
-          RX bytes:10860168129 (10.8 GB)  TX bytes:19336447379 (19.3 GB)
-EOF
-my $leases_eth0=<<'EOF';
-lease {
-  interface "eth0";
-  fixed-address 191.3.88.152;
-  option subnet-mask 255.255.255.224;
-  option dhcp-lease-time 2626;
-  option routers 191.3.88.1;
-  option dhcp-message-type 5;
-  option broadcast-address 255.255.255.255;
-}
-EOF
+};
+
 
 use_ok('Net::ISP::Balance');
 my $bal = Net::ISP::Balance->new("$Bin/etc/balance.conf",
-			         "$Bin/etc/interfaces",
-				 {
-				 ifconfig_eth0 => $ifconfig_eth0,
-				 ifconfig_eth1 => $ifconfig_eth1,
-				 ifconfig_eth2 => $ifconfig_eth2,
-				 ifconfig_eth3 => $ifconfig_eth3,
-				 ifconfig_ppp0 => $ifconfig_ppp0,
-				 leases_eth0   => $leases_eth0,
-				 }	       
-    );
+				 $dummy_data);
 ok($bal,"balancer object created");
 
 my $i = $bal->services;
 my @s = sort keys %$i;
-is("@s",'CABLE DSL LAN SUBNET',"four services created");
+is("@s",'CABLE DSL LAN SUBNET VPN',"five services created");
 
 is($i->{DSL}{dev},'ppp0','correct mapping of service to ppp device');
 is($i->{CABLE}{dev},'eth0','correct mapping of service to eth device');
@@ -92,6 +77,7 @@ is($i->{CABLE}{ip},'191.3.88.152','correct mapping of dhcp service to ip');
 is($i->{LAN}{ip},'192.168.10.1','correct mapping of static service to ip');
 is($i->{DSL}{gw},'112.211.154.198','correct mapping of ppp service to gw');
 is($i->{CABLE}{gw},'191.3.88.1','correct mapping of dhcp service to gw');
+is($i->{VPN}{net},'10.8.0.0/24','correct network for VPN device derived from routing table');
 ok(defined($i->{CABLE}{fwmark}),'balanced fwmark defined');
 ok(!defined($i->{LAN}{fwmark}),'non-balanced fwmark undefined');
 is($bal->dev('DSL'),'ppp0','shortcut working');
@@ -110,13 +96,13 @@ my $output = capture(sub {$bal->enable_forwarding(0);
     );
 
 ok($output =~ m!echo 0 > /proc/sys/net/ipv4/ip_forward!,'correct forwarding setting');
-ok($output=~/ip route add default scope global nexthop via 112.211.154.198 dev ppp0 weight 1 nexthop via 191.3.88.1 dev eth0 weight 1/,
+ok($output=~/ip route add default scope global nexthop via 191.3.88.1 dev eth0 weight 1 nexthop via 112.211.154.198 dev ppp0 weight 1/,
    'correct default route creation');
 ok($output=~m!ip route add table 1 192.168.10.0/24 dev eth1 src 192.168.10.1!,'correct table addition');
 ok($output=~m!echo "01 local routing rules go here"! &&
    $output=~m!echo "02 local routes go here"!,
    'local rule addition');
-ok($output=~m!debug: DSL=>dev=ppp0\ndebug: CABLE=>dev=eth0!,'perl local rules working');
+ok($output=~m!debug: CABLE=>dev=eth0\ndebug: DSL=>dev=ppp0!,'perl local rules working');
 
 $output = capture(sub {$bal->balancing_fw_rules});
 ok($output=~m/iptables -t mangle -A PREROUTING -i eth1 -m conntrack --ctstate NEW -m statistic --mode random --probability 0.5 -j MARK-CABLE/,'balancing firewall rules produce correct mangle');
@@ -132,7 +118,7 @@ ok($output =~ /iptables -t mangle -A POSTROUTING -o ppp0 -p tcp --tcp-flags SYN,
    'clamp rules correct');
 ok($output =~ m!iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT!,
    'icmp echo flood rules correct');
-ok($output =~ m[iptables -A FORWARD  -i eth1 -o ppp0 -s 192.168.10.0/24 ! -d 192.168.10.0/24 -j ACCEPT],
+ok($output =~ m[iptables -A FORWARD -i eth1 -o ppp0 -s 192.168.10.0/24 -j ACCEPT],
    'forwarding rules correct');
 
 $output = capture(
@@ -178,9 +164,9 @@ exit 0;
 sub capture {
     my $subroutine = shift;
     my $output = '';
-    tie *FOO,'IO::String',$output;
-    local *STDOUT = \*FOO;
+    open my $fh,'>',\$output or die $!;
+    local *STDOUT = $fh;
     $subroutine->();
-    untie *FOO;
+    close $fh;
     return $output;
 }
