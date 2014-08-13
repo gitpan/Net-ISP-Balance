@@ -7,7 +7,7 @@ use Carp 'croak','carp';
 eval 'use Net::Netmask';
 eval 'use Net::ISP::Balance::ConfigData';
 
-our $VERSION    = '1.07';
+our $VERSION    = '1.08';
 
 =head1 NAME
 
@@ -785,12 +785,12 @@ should be used for balancing.
 
 sub up {
     my $self = shift;
+    $self->{up} = \@_ if @_;
     unless ($self->{up}) { # initialize with running services
 	my @svc = grep {$self->running($_)} $self->isp_services;
 	$self->{up} = \@svc;
     }
     my @up = @{$self->{up}};
-    $self->{up} = \@_ if @_;
     return @up;
 }
 
