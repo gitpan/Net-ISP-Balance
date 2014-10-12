@@ -7,7 +7,7 @@ use Carp 'croak','carp';
 eval 'use Net::Netmask';
 eval 'use Net::ISP::Balance::ConfigData';
 
-our $VERSION    = '1.09';
+our $VERSION    = '1.10';
 
 =head1 NAME
 
@@ -570,8 +570,9 @@ sub _service_or_device {
 
 =head2 $bal->forward($incoming_port,$destination_host,@protocols)
 
-This method emits appropriate port/host forwarding rules. Destination host can
-accept any of these forms:
+This method emits appropriate port/host forwarding rules using DNAT
+address translation. The destination host can be specified using
+either of these forms:
 
   192.168.100.1       # forward to same port as incoming
   192.168.100.1:8080  # forward to a different port on host
@@ -608,6 +609,50 @@ sub forward {
 	    }
 	}
     }
+}
+
+=head2 $bal->forward_with_snat($incoming_port,$destination_host,@protocols)
+
+This method is the same as forward(), except that it also does source
+NATing from LAN-based requests to make the request appear to have come
+from the router. This is used when you expose a server, such as a web
+server, to the internet, but you also need to access the server from
+machines on the LAN. Use this if you find that the service is visible
+from outside the LAN but not inside the LAN.
+
+Examples:
+
+    $bal->forward_with_snat(80 => '192.168.100.1');
+    $bal->forward_with_snat(80 => '192.168.100.1:8080','tcp');
+
+
+=cut
+
+sub forward_with_snat {
+    my $self = shift;
+    my ($port,$host,@protocols) = @_;    
+
+    @protocols = ('tcp') unless @protocols;
+
+    my ($dhost,$dport)   = split ':',$host;
+    $dhost         ||= $host;
+    $dport         ||= $port;
+
+    for my $protocol (@protocols) {
+	for my $svc ($self->isp_services) {
+	    my $external_ip = $self->ip($svc);
+	    $self->iptables("-t nat -A PREROUTING -d $external_ip -p $protocol --dport $port -j DNAT --to-destination $host");
+	}
+
+	for my $lan ($self->lan_services) {
+	    my $lannet = $self->net($lan);
+	    $self->iptables("-t nat -A POSTROUTING -s $lannet -p $protocol --dport $port -d $host -j MASQUERADE");
+	}
+
+    $self->iptables("-A FORWARD -p $protocol --dport $port -d $host -j ACCEPT");
+
+    }
+
 }
 
 =head2 $bal->ip_route(@args)
@@ -1158,7 +1203,11 @@ sub _collect_interfaces {
     my $a    = $self->_ip_addr_show;
     my (undef,@ifs)  = split /^\d+: /m,$a;
     chomp(@ifs);
-    my %ifs = map {split(/: /,$_,2)} @ifs;
+    my %ifs = map {
+	my ($dev,$config) = split(/: /,$_,2);
+	$dev =~ s/\@.+$//;  # get rid of bonding master information
+	($dev,$config);
+    } @ifs;
 
     # get existing routes
     my (%gws,%nets);
@@ -1191,7 +1240,8 @@ sub _collect_interfaces {
 	my ($addr,$bits)= $info =~ /inet (\d+\.\d+\.\d+\.\d+)(?:\/(\d+))?/;
 	$bits ||= 32;
 	my ($peer)      = $info =~ /peer\s+(\d+\.\d+\.\d+\.\d+)/;
-	my $block       = Net::Netmask->new2("$addr/$bits") or die "unable to derive address for $dev: $Net::Netmask::error\nifconfig = \n$info";
+	my $block       = Net::Netmask->new2("$addr/$bits") 
+	    or die "unable to derive address for $dev: $Net::Netmask::error\nifconfig = \n$info";
 	my $gw          = $gws{$dev}  || $peer                    || $self->_dhcp_gateway($dev) || $block->nth(1);
 	my $net         = $nets{$dev} || ($peer?"$peer/32":undef) || "$block";
 	$ifaces{$svc} = {
